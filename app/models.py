@@ -68,8 +68,14 @@ class Report(Base):
     collision_zone_no = Column(Integer, nullable=True)
     conclusion = Column(Text, nullable=False)
 
+    # 多刀模式（请求传入 tools）首碰撞命中时固化：事件发生时的刀号与半径
+    # （初始刀位命中时刀号为 NULL）；单刀旧报告两列均为 NULL
+    collision_tool_no = Column(Integer, nullable=True)
+    collision_tool_radius = Column(Float, nullable=True)
+
     # 可选的全程最小水平净间隙（仅 include_min_clearance=true 的报告固化）
     min_clearance_enabled = Column(Boolean, nullable=False, default=False,
                                    server_default="0")
-    # {min_clearance_mm, line_no, point_mm, zone_no, progress} 或 None
+    # 多刀模式：{min_clearance_mm, line_no, point_mm, zone_no, progress,
+    #           tool_no, tool_radius_mm} 或 None；单刀旧报告无 tool_* 键
     min_clearance = Column(JSON, nullable=True)

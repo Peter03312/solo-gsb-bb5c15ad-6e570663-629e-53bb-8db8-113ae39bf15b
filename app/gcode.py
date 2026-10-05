@@ -48,6 +48,16 @@ class GCodeError(ValueError):
         super().__init__(prefix + message)
 
 
+@dataclass(frozen=True)
+class ToolSwitch:
+    """一次换刀事件：Tn 在其所在物理行先于该行运动生效。
+
+    仅当请求启用刀号 -> 半径映射时产生；未启用映射时 T 字一律忽略。
+    """
+    line_no: int
+    tool_no: int
+
+
 @dataclass
 class Motion:
     """一段连续运动（毫米单位），start/end 为刀位点（刀尖）XY/Z。"""
@@ -68,6 +78,8 @@ class ParseResult:
     line_count: int = 0
     nonblank_count: int = 0
     final_position: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    # 按程序顺序记录的换刀事件（仅启用刀号映射时非空）
+    tool_switches: list[ToolSwitch] = field(default_factory=list)
 
 
 def _strip_comment(line: str, line_no: int) -> str:
@@ -126,10 +138,16 @@ def _tokenize(line: str, line_no: int) -> list[tuple[str, float]]:
 
 
 def parse_gcode(text: str,
-                start_xyz: tuple[float, float, float]) -> ParseResult:
+                start_xyz: tuple[float, float, float],
+                tool_radii: dict[int, float] | None = None) -> ParseResult:
     """解析 G-code 文本，返回按程序顺序排列的连续运动序列。
 
     start_xyz：毫米制初始刀尖坐标（绝对，后续 G90/G91 从该点开始模态延续）。
+
+    tool_radii：可选的非负整数刀号 -> 非负有限毫米半径映射。传入即为启用
+    多刀模式：每行至多一个 T，T 值必须为非负整数且在映射中（否则 422 语义
+    拒绝）；Tn 在其所在行先于运动生效，并记录为一次 ToolSwitch。
+    传入 None（默认）时 T 字依旧解析后忽略，与单刀旧行为完全一致。
     """
     if not isinstance(text, str):
         raise GCodeError("gcode 必须为文本")
@@ -156,6 +174,8 @@ def parse_gcode(text: str,
         # 拆分 G 字与轴字；同一地址字重复明确拒绝
         g_codes: list[int] = []
         axes: dict[str, float] = {}
+        # 启用多刀时校验 T 字：同行多个 T、非整数/负数、未映射刀号一律拒绝
+        t_words: list[float] = []
         for letter, value in tokens:
             if letter == 'G':
                 if value != int(value):
@@ -174,11 +194,27 @@ def parse_gcode(text: str,
                 axes[letter] = value
             elif letter == 'R':
                 raise GCodeError("不支持 R 形式圆弧（仅支持 I/J 圆心格式）", idx)
-            elif letter in ("F", "S", "N", "M", "T", "P", "L", "H", "D"):
-                # 进给/转速/行号/辅助功能/刀号/补偿号等不参与几何运动，忽略
+            elif letter == 'T':
+                t_words.append(value)
+            elif letter in ("F", "S", "N", "M", "P", "L", "H", "D"):
+                # 进给/转速/行号/辅助功能/补偿号等不参与几何运动，忽略
                 pass
             else:
                 raise GCodeError(f"不支持的地址字 {letter}", idx)
+
+        # 多刀模式下处理本行换刀（先于本行任何运动生效）；未启用映射时 T 忽略
+        if tool_radii is not None and t_words:
+            if len(t_words) > 1:
+                raise GCodeError("同一行出现多个 T 换刀指令", idx)
+            t_val = t_words[0]
+            if t_val != int(t_val):
+                raise GCodeError(f"刀号 T{t_val:g} 必须为非负整数", idx)
+            tool_no = int(t_val)
+            if tool_no < 0:
+                raise GCodeError(f"刀号 T{tool_no} 不得为负", idx)
+            if tool_no not in tool_radii:
+                raise GCodeError(f"刀号 T{tool_no} 未在刀具半径映射中登记", idx)
+            result.tool_switches.append(ToolSwitch(idx, tool_no))
 
         # 先处理模态 G 字（平面/单位/绝对增量），再确定本行运动
         line_motion: int | None = None

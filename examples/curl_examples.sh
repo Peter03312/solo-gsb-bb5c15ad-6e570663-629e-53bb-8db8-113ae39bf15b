@@ -96,3 +96,73 @@ curl -s -X POST "$BASE/reviews" \
         "tool_radius": 0.5,
         "gcode": "G1 X15 Y11 Z0\n"
       }'; echo
+
+echo "== 11) 多刀：传入 tools 刀号->半径映射；Tn 在其所在行先于运动生效 =="
+# 初始刀位/首段用 tool_radius=0.5（刀号为空）；T1 换为 r=2，路径 y=11 距边 1，
+# 2mm 大刀在第 2 行运动中碰撞；首碰撞固化原行号、刀号 1 与半径 2
+curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5, 11, 0],
+        "tool_radius": 0.5,
+        "gcode": "G1 X0 Y11 Z0\nT1 G1 X15 Y11 Z0\n",
+        "tools": {"1": 2.0},
+        "include_min_clearance": true
+      }'; echo
+
+echo "== 12) 多刀：独立 T 行先按新半径检查当前静止刀位 =="
+# 运动到 (0,11) 后独立换 T1(r=1)，该静止点距禁区边恰好 1mm => 接触碰撞在第 2 行
+curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5, 11, 0],
+        "tool_radius": 0.5,
+        "gcode": "G1 X0 Y11 Z0\nT1\nG1 X15 Y20 Z0\n",
+        "tools": {"1": 1.0}
+      }'; echo
+
+echo "== 13) 多刀非法输入一律 422 且不生成报告：未映射刀号/非整数 T/同行多 T/非法半径 =="
+curl -s -o /dev/null -w "未映射 T9: HTTP %{http_code}\n" -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [0,0,0], "tool_radius": 0.5,
+        "gcode": "T9 G1 X1\n",
+        "tools": {"1": 2.0}
+      }'
+curl -s -o /dev/null -w "非整数 T1.5: HTTP %{http_code}\n" -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [0,0,0], "tool_radius": 0.5,
+        "gcode": "T1.5 G1 X1\n",
+        "tools": {"1": 2.0}
+      }'
+curl -s -o /dev/null -w "同行多个 T: HTTP %{http_code}\n" -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [0,0,0], "tool_radius": 0.5,
+        "gcode": "T1 T2 G1 X1\n",
+        "tools": {"1": 2.0, "2": 1.0}
+      }'
+curl -s -o /dev/null -w "非法负半径: HTTP %{http_code}\n" -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [0,0,0], "tool_radius": 0.5,
+        "gcode": "G1 X1\n",
+        "tools": {"1": -0.2}
+      }'
+
+echo "== 14) 不传 tools：T 字仍被忽略，单刀旧行为完全兼容 =="
+curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5, 11, 0],
+        "tool_radius": 0.5,
+        "gcode": "T9 G1 X15 Y11 Z0\n"
+      }'; echo

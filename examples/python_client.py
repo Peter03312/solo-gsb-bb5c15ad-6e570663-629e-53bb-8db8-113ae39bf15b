@@ -102,6 +102,64 @@ def main() -> None:
     assert legacy["min_clearance"] is None
     print("legacy compatible: min_clearance =", legacy["min_clearance"])
 
+    # 8. 多刀：传入 tools（非负整数刀号 -> 非负有限毫米半径映射）。
+    #    初始刀位仍用 tool_radius（刀号为空）；T1 在其所在行先于运动生效，
+    #    之后运动沿用 r=2 的大刀直至下次切换。
+    multi = c.post("/reviews", json={
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5.0, 11.0, 0.0],
+        "tool_radius": 0.5,
+        "gcode": "G1 X0 Y11 Z0\nT1 G1 X15 Y11 Z0\n",
+        "tools": {"1": 2.0},
+        "include_min_clearance": True,
+    })
+    multi.raise_for_status()
+    b = multi.json()
+    print("multi-tool collision:",
+          b["collision_line_no"], b["collision_tool_no"],
+          b["collision_tool_radius_mm"],
+          b["min_clearance"])
+    assert b["collision_tool_no"] == 1
+    assert b["collision_tool_radius_mm"] == 2.0
+    assert b["min_clearance"]["tool_no"] == 1
+    # 结果随报告固化
+    assert c.get(f"/reports/{b['report_id']}").json()["collision_tool_no"] == 1
+
+    # 9. 独立 T 行：换刀后先按新半径检查当前静止刀位，再执行后续运动
+    static_hit = c.post("/reviews", json={
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5.0, 11.0, 0.0],
+        "tool_radius": 0.5,
+        "gcode": "G1 X0 Y11 Z0\nT1\nG1 X15 Y20 Z0\n",
+        "tools": {"1": 1.0},
+    })
+    static_hit.raise_for_status()
+    sb = static_hit.json()
+    print("standalone T-line first hit line:", sb["collision_line_no"])
+    assert sb["collision_line_no"] == 2 and sb["collision_tool_no"] == 1
+
+    # 10. 未传 tools 时 T 字仍被忽略（单刀旧行为）；非法多刀输入一律 422
+    ignore_t = c.post("/reviews", json={
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5.0, 11.0, 0.0],
+        "tool_radius": 0.5,
+        "gcode": "T9 G1 X15 Y11 Z0\n",
+    }).json()
+    assert not ignore_t["has_collision"] and ignore_t["collision_tool_no"] is None
+    for bad in (
+        {"gcode": "T9 G1 X1\n", "tools": {"1": 2.0}},       # 未映射刀号
+        {"gcode": "T1.5 G1 X1\n", "tools": {"1": 2.0}},     # T 非整数
+        {"gcode": "T-1 G1 X1\n", "tools": {"1": 2.0}},      # T 为负
+        {"gcode": "T1 T2 G1 X1\n",                          # 同行多个 T
+         "tools": {"1": 2.0, "2": 1.0}},
+        {"gcode": "G1 X1\n", "tools": {"1": -0.2}},         # 非法半径
+    ):
+        rr = c.post("/reviews", json={
+            "zones": [{"zone_no": 1, "version": 1}],
+            "start": [0.0, 0.0, 0.0], "tool_radius": 0.5, **bad})
+        assert rr.status_code == 422, (bad, rr.status_code)
+    print("multi-tool invalid inputs all rejected with 422")
+
 
 if __name__ == "__main__":
     main()

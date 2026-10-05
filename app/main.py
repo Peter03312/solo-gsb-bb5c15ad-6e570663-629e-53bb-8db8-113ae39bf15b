@@ -6,21 +6,26 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import func, inspect, select, text
 from sqlalchemy.orm import Session
 
-from .collision import Zone, check_path, initial_collision, minimum_clearance
+from .collision import (Zone, check_path, check_path_events, build_check_events,
+                        initial_collision, minimum_clearance,
+                        minimum_clearance_events)
 from .database import Base, engine, get_db
 from .gcode import GCodeError, parse_gcode
 from .geometry import GeometryError, normalize_polygon, validate_z_range
 from . import models
 from .models import Report, ZoneVersion
-from .schemas import (MinClearanceOut, ReviewRequest, ReviewResponse, ZoneCreate,
-                      ZoneDetailOut, ZoneOut, ZoneVersionCreate, ZoneVersionOut)
+from .schemas import (MinClearanceMultiOut, MinClearanceOut, ReviewRequest,
+                      ReviewResponse, ZoneCreate, ZoneDetailOut, ZoneOut,
+                      ZoneVersionCreate, ZoneVersionOut)
 
 app = FastAPI(
     title="数控刀路禁入区审查服务",
-    version="1.1.0",
+    version="1.2.0",
     description="登记毫米制二维多边形禁区（含闭合 Z 高度范围、不可变版本），"
                 "对 G-code 刀路做连续碰撞审查并出具不可变报告；"
-                "可选计算全程最小水平净间隙（include_min_clearance）。",
+                "可选计算全程最小水平净间隙（include_min_clearance）；"
+                "可选多刀：传入非负整数刀号到非负毫米半径的映射（tools），"
+                "Tn 在其所在行先于运动生效。",
 )
 
 
@@ -33,10 +38,11 @@ def on_startup() -> None:
 
 
 def _ensure_report_columns(db_engine) -> None:
-    """对旧数据库幂等添加 reports.min_clearance(_enabled) 列。
+    """对旧数据库幂等添加 reports 新增列。
 
     PostgreSQL 支持 BOOLEAN/JSON 原生类型；SQLite 对列类型仅按名称亲和处理，
-    同名 DDL 同样可用。
+    同名 DDL 同样可用。v1.0 旧库补 min_clearance(_enabled)；
+    v1.1 之前的库再补多刀 collision_tool_no/collision_tool_radius。
     """
     inspector = inspect(db_engine)
     if "reports" not in inspector.get_table_names():
@@ -52,6 +58,12 @@ def _ensure_report_columns(db_engine) -> None:
         if "min_clearance" not in existing:
             conn.execute(text(
                 "ALTER TABLE reports ADD COLUMN min_clearance JSON"))
+        if "collision_tool_no" not in existing:
+            conn.execute(text(
+                "ALTER TABLE reports ADD COLUMN collision_tool_no INTEGER"))
+        if "collision_tool_radius" not in existing:
+            conn.execute(text(
+                "ALTER TABLE reports ADD COLUMN collision_tool_radius FLOAT"))
 
 
 @app.exception_handler(GeometryError)
@@ -194,9 +206,15 @@ def review(payload: ReviewRequest,
     # 先加载并固化所用禁区版本；任何非法输入都在写报告之前拒绝
     zones, used_versions, _ = _load_zones(db, payload.zones)
 
-    # 解析 G-code；语法/语义错误明确拒绝，不留报告
+    tools = payload.tools
+    multi_tool = tools is not None
+
+    # 解析 G-code；语法/语义错误明确拒绝，不留报告。
+    # 多刀模式下 T 字按映射校验（非整数/负数、同行多个 T、未映射刀号 => 422）；
+    # 未传映射时 T 仍解析后忽略，与单刀旧行为一致。
     try:
-        parsed = parse_gcode(payload.gcode, tuple(payload.start))  # type: ignore[arg-type]
+        parsed = parse_gcode(payload.gcode, tuple(payload.start),  # type: ignore[arg-type]
+                             tool_radii=tools)
     except GCodeError as exc:
         raise HTTPException(status_code=422, detail={
             "error": "invalid_gcode",
@@ -213,28 +231,48 @@ def review(payload: ReviewRequest,
         "final_position_mm": list(parsed.final_position),
         "gcode_sha256": __sha(payload.gcode),
         "include_min_clearance": bool(payload.include_min_clearance),
+        # 固化本次审查的多刀配置：多刀模式记录刀号->半径映射，单刀为 null
+        "tools": ({str(no): r for no, r in sorted(tools.items())}
+                  if multi_tool else None),
     }
 
-    collision = check_path(parsed.motions, zones, payload.tool_radius)
+    start_xyz = tuple(payload.start)  # type: ignore[var-annotated]
 
-    # 可选：全程最小水平净间隙（不影响首碰撞结论/行号）
-    min_clr = minimum_clearance(parsed.motions, zones, payload.tool_radius,
-                                tuple(payload.start)) \
-        if payload.include_min_clearance else None
+    if multi_tool:
+        # 多刀：初始刀位静止事件（刀号空、半径 tool_radius）先行；
+        # 每次 T 切换先按新半径检查当前静止刀位，随后运动沿用该刀。
+        events = build_check_events(parsed.motions, parsed.tool_switches,
+                                    tools, start_xyz, payload.tool_radius)
+        collision = check_path_events(events, zones)
+        min_clr = minimum_clearance_events(events, zones) \
+            if payload.include_min_clearance else None
 
-    line_no: int | None = None
-    zone_no: int | None = None
-
-    if collision is not None:
-        line_no = collision.line_no
-        zone_no = collision.zone_no
+        line_no = collision.line_no if collision is not None else None
+        zone_no = collision.zone_no if collision is not None else None
+        coll_tool_no = collision.tool_no if collision is not None else None
+        coll_tool_r = collision.tool_radius if collision is not None else None
     else:
-        # 无运动段碰撞时检查初始刀位点；有运动段时归属首个运动行号
-        static_zone = initial_collision(tuple(payload.start),  # type: ignore[arg-type]
-                                        zones, payload.tool_radius)
-        if static_zone is not None:
-            zone_no = static_zone
-            line_no = parsed.motions[0].line_no if parsed.motions else None
+        collision = check_path(parsed.motions, zones, payload.tool_radius)
+
+        # 可选：全程最小水平净间隙（不影响首碰撞结论/行号）
+        min_clr = minimum_clearance(parsed.motions, zones, payload.tool_radius,
+                                    start_xyz) \
+            if payload.include_min_clearance else None
+
+        line_no: int | None = None
+        zone_no: int | None = None
+        coll_tool_no: int | None = None
+        coll_tool_r: float | None = None
+
+        if collision is not None:
+            line_no = collision.line_no
+            zone_no = collision.zone_no
+        else:
+            # 无运动段碰撞时检查初始刀位点；有运动段时归属首个运动行号
+            static_zone = initial_collision(start_xyz, zones, payload.tool_radius)
+            if static_zone is not None:
+                zone_no = static_zone
+                line_no = parsed.motions[0].line_no if parsed.motions else None
 
     has_coll = zone_no is not None
 
@@ -256,6 +294,10 @@ def review(payload: ReviewRequest,
             "zone_no": min_clr.zone_no,
             "progress": min_clr.progress,
         }
+        if multi_tool:
+            # 多刀模式额外固化命中时的刀号与半径（初始刀位刀号为 null）
+            clearance_payload["tool_no"] = min_clr.tool_no
+            clearance_payload["tool_radius_mm"] = min_clr.tool_radius
 
     report = Report(
         zone_versions=used_versions,
@@ -264,6 +306,8 @@ def review(payload: ReviewRequest,
         collision_line_no=line_no,
         collision_zone_no=zone_no,
         conclusion=conclusion,
+        collision_tool_no=coll_tool_no,
+        collision_tool_radius=coll_tool_r,
         min_clearance_enabled=bool(payload.include_min_clearance),
         min_clearance=clearance_payload,
     )
@@ -276,9 +320,13 @@ def review(payload: ReviewRequest,
         input_summary=summary, has_collision=has_coll,
         collision_line_no=line_no, collision_zone_no=zone_no,
         conclusion=conclusion, message=message,
-        min_clearance=MinClearanceOut(**clearance_payload)
-        if clearance_payload is not None else None,
-        min_clearance_enabled=bool(payload.include_min_clearance))
+        min_clearance=(MinClearanceMultiOut(**clearance_payload)
+                       if (clearance_payload is not None and multi_tool)
+                       else MinClearanceOut(**clearance_payload)
+                       if clearance_payload is not None else None),
+        min_clearance_enabled=bool(payload.include_min_clearance),
+        collision_tool_no=coll_tool_no,
+        collision_tool_radius_mm=coll_tool_r)
 
 
 @app.get("/reports/{report_id}", summary="查询不可变审查报告")
@@ -304,6 +352,9 @@ def get_report(report_id: int, db: Session = Depends(get_db)) -> dict:
         # 固化的可选最小净间隙：未启用的旧报告不含/为空，查询保持一致
         "min_clearance": report.min_clearance,
         "min_clearance_enabled": bool(report.min_clearance_enabled),
+        # 多刀模式固化的首碰撞刀号（初始刀位为 null）与半径；单刀旧报告为 null
+        "collision_tool_no": report.collision_tool_no,
+        "collision_tool_radius_mm": report.collision_tool_radius,
     }
 
 
