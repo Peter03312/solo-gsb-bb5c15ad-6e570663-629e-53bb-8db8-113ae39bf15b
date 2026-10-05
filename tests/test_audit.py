@@ -1,6 +1,7 @@
 """端到端与单元测试。使用 SQLite 覆盖数据库，无需 PostgreSQL。"""
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -13,7 +14,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app import gcode as gc  # noqa: E402
-from app.collision import Zone, check_path, initial_collision, minimum_clearance  # noqa: E402
+from app import models  # noqa: E402
+from app.collision import (Zone, check_path, check_program, initial_collision,
+                           minimum_clearance, minimum_clearance_program)  # noqa: E402
 from app.geometry import GeometryError, normalize_polygon  # noqa: E402
 from app.main import app  # noqa: E402
 from app.database import Base, engine  # noqa: E402
@@ -563,6 +566,336 @@ class ClearanceApiTests(unittest.TestCase):
             "z_min": -5, "z_max": 5})
         got = client.get(f"/reports/{rid}").json()
         self.assertEqual(got["min_clearance"], mc1)
+
+
+class MultiToolParserTests(unittest.TestCase):
+    START = (-5.0, 11.0, 0.0)
+
+    def parse(self, text, tmap=None, r0=0.0):
+        if tmap is None:
+            return gc.parse_gcode(text, self.START)
+        return gc.parse_gcode(text, self.START, tool_radius_map=tmap,
+                              initial_tool_radius=r0)
+
+    def test_legacy_t_ignored(self):
+        r = self.parse("T5 M6\nG1 X3 Y0\n")
+        self.assertEqual(len(r.motions), 1)
+        self.assertEqual(r.tool_events, [])
+
+    def test_mapping_empty_means_all_t_rejected(self):
+        with self.assertRaises(gc.GCodeError):
+            self.parse("T0\nG1 X1\n", tmap={})
+
+    def test_tool_takes_effect_on_same_line_motion(self):
+        r = self.parse("T2 G1 X15 Y11\n", tmap={2: 3.0}, r0=0.5)
+        m = r.motions[0]
+        self.assertEqual(m.tool_no, 2)
+        self.assertEqual(m.tool_radius, 3.0)
+        self.assertEqual(r.tool_events, [])  # 同行有运动，不产生静止事件
+        # T 之前的运动沿用初始刀（刀号为空）
+        r2 = self.parse("G1 X0 Y11\nT2\nG1 X15 Y11\n", tmap={2: 3.0}, r0=0.5)
+        self.assertIsNone(r2.motions[0].tool_no)
+        self.assertEqual(r2.motions[0].tool_radius, 0.5)
+        self.assertEqual(r2.motions[1].tool_no, 2)
+
+    def test_standalone_t_emits_static_event_with_new_radius(self):
+        r = self.parse("T2\nG1 X15 Y11\n", tmap={2: 3.0}, r0=0.5)
+        self.assertEqual(len(r.motions), 1)
+        ev = r.tool_events[0]
+        self.assertEqual(ev.line_no, 1)
+        self.assertEqual(ev.tool_no, 2)
+        self.assertEqual(ev.tool_radius, 3.0)
+        self.assertEqual(ev.pos, self.START)
+        self.assertEqual([ev.seq, r.motions[0].seq], [1, 2])
+
+    def test_tool_modal_persists_until_next_change(self):
+        r = self.parse("T1\nG1 X0 Y11\nG1 X5 Y11\nT2\nG1 X15 Y11\n",
+                       tmap={1: 1.0, 2: 2.0}, r0=0.0)
+        self.assertEqual([m.tool_no for m in r.motions], [1, 1, 2])
+        self.assertEqual([m.tool_radius for m in r.motions], [1.0, 1.0, 2.0])
+
+    def test_zero_tool_no_allowed(self):
+        r = self.parse("T0 G1 X1 Y11\n", tmap={0: 1.0}, r0=0.0)
+        self.assertEqual(r.motions[0].tool_no, 0)
+
+    def test_invalid_t_rejected(self):
+        cases = (
+            "T1.5 G1 X1\n",   # 非整数
+            "T-1 G1 X1\n",    # 负数
+            "T9 G1 X1\n",     # 未映射刀号
+            "T1 T2 G1 X1\n",  # 同行多个 T
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                with self.assertRaises(gc.GCodeError):
+                    self.parse(text, tmap={1: 1.0, 2: 1.0})
+
+    def test_zero_length_t_line_becomes_static_event(self):
+        # T + 轴字但终点与当前点重合：无运动段，按独立 T 行静止换刀
+        r = self.parse("T2 X-5 Y11\n", tmap={2: 3.0}, r0=0.5)
+        self.assertEqual(r.motions, [])
+        self.assertEqual(len(r.tool_events), 1)
+        self.assertEqual(r.tool_events[0].tool_no, 2)
+
+
+class MultiToolEngineTests(unittest.TestCase):
+    def setUp(self):
+        # 10x10 方块禁区，z ∈ [-5, 5]
+        self.zone = Zone(1, normalize_polygon(SQUARE), -5.0, 5.0)
+
+    def check(self, text, start=(-5.0, 11.0, 0.0), r0=0.0, tmap=None,
+              zones=None):
+        p = gc.parse_gcode(text, start, tool_radius_map=tmap,
+                           initial_tool_radius=r0)
+        return check_program(p.motions, p.tool_events, zones or [self.zone],
+                             start, r0)
+
+    def test_small_then_large_tool_collision_uses_event_radius(self):
+        # y=11 距方块上边/角最近 1mm：初始 r=0 段只在 x<0 的安全区，
+        # T1(r=2) 后横穿 => 碰撞，命中半径/刀号随事件固化
+        c = self.check("G1 X-2 Y11\nT1\nG1 X15 Y11\n", tmap={1: 2.0})
+        self.assertIsNotNone(c)
+        self.assertEqual(c.line_no, 3)
+        self.assertEqual(c.tool_no, 1)
+        self.assertEqual(c.tool_radius, 2.0)
+
+    def test_large_then_small_tool_avoids_collision(self):
+        # 初始 r=2 的段停在远处安全区（(-5,50)），换 r=0.5 后沿 y=11 横穿：
+        # 最近距离 1mm > 0.5 => 无碰撞
+        c = self.check("G1 X-5 Y50\nT1\nG1 X15 Y11\n",
+                       r0=2.0, tmap={1: 0.5})
+        self.assertIsNone(c)
+
+    def test_standalone_t_static_collision(self):
+        # 静止点 (0,11) 距上边 1mm：换 r=2 的刀 => 静止即碰撞，行号为 T 行
+        c = self.check("G1 X0 Y11\nT1\nG1 X15 Y11\n",
+                       start=(-5.0, 11.0, 0.0), tmap={1: 2.0})
+        self.assertIsNotNone(c)
+        self.assertEqual(c.line_no, 2)
+        self.assertEqual(c.tool_no, 1)
+        self.assertEqual(c.tool_radius, 2.0)
+
+    def test_initial_position_hit_has_null_tool_and_radius_initial(self):
+        c = self.check("(nothing)\n", start=(5.0, 5.0, 0.0), r0=0.5,
+                       tmap={1: 9.0})
+        self.assertIsNotNone(c)
+        self.assertIsNone(c.line_no)
+        self.assertIsNone(c.tool_no)
+        self.assertEqual(c.tool_radius, 0.5)
+
+    def test_tie_execution_order_then_progress_then_zone(self):
+        # 初始刀位 (0,11)：距 1 号禁区 1mm，r=1 恰好接触（seq=0）；
+        # 后续独立 T 行 r=1 静止同样接触（seq=1）=> 取初始刀位（顺序更早）
+        z2 = Zone(2, normalize_polygon([[0, -10], [10, -10], [10, 0], [0, 0]]),
+                  -5.0, 5.0)
+        c = self.check("T1\n", start=(0.0, 11.0, 0.0), r0=1.0,
+                       tmap={1: 1.0}, zones=[self.zone, z2])
+        self.assertIsNotNone(c)
+        self.assertIsNone(c.line_no)
+        self.assertIsNone(c.tool_no)
+        # 同点同时被两禁区接触：取小编号
+        z3 = Zone(3, normalize_polygon([[0, 11], [10, 11], [10, 12], [0, 12]]),
+                  -5.0, 5.0)
+        c2 = self.check("(x)\n", start=(0.0, 11.0, 0.0), r0=1.0,
+                        tmap={1: 1.0}, zones=[z3, self.zone])
+        self.assertEqual(c2.zone_no, 1)
+
+
+class MultiToolClearanceEngineTests(unittest.TestCase):
+    def setUp(self):
+        self.zone = Zone(1, normalize_polygon(SQUARE), -5.0, 5.0)
+
+    def clr(self, text, start, r0, tmap):
+        p = gc.parse_gcode(text, start, tool_radius_map=tmap,
+                           initial_tool_radius=r0)
+        return minimum_clearance_program(p.motions, p.tool_events,
+                                         [self.zone], start, r0)
+
+    def test_clearance_uses_radius_at_event(self):
+        # 初始 r=2 段净间隙 1-2=-1；换 r=0.5 后同高度段净间隙 0.5 => 全局 -1
+        cp = self.clr("G1 X0 Y11\nT1\nG1 X15 Y11\n",
+                      (-5.0, 11.0, 0.0), 2.0, {1: 0.5})
+        self.assertEqual(cp.net, -1.0)
+        self.assertEqual(cp.line_no, 1)
+        self.assertIsNone(cp.tool_no)          # 初始刀
+        self.assertEqual(cp.tool_radius, 2.0)
+
+    def test_clearance_static_tool_change_candidate(self):
+        # 初始点远离禁区（净间隙大）；T 行静止点 (0,11) r=2 => -1
+        cp = self.clr("G1 X0 Y11\nT1\nG1 X15 Y11\n",
+                      (-5.0, 11.0, 0.0), 0.0, {1: 2.0})
+        self.assertEqual(cp.net, -1.0)
+        self.assertEqual(cp.line_no, 2)
+        self.assertEqual(cp.tool_no, 1)
+        self.assertEqual(cp.tool_radius, 2.0)
+        self.assertEqual(cp.point, (0.0, 11.0, 0.0))
+
+    def test_clearance_initial_position_null_line_and_tool(self):
+        cp = self.clr("(only comment)\n", (5.0, 5.0, 0.0), 0.5, {1: 9.0})
+        self.assertEqual(cp.net, -0.5)
+        self.assertIsNone(cp.line_no)
+        self.assertIsNone(cp.tool_no)
+        self.assertEqual(cp.tool_radius, 0.5)
+
+
+class MultiToolApiTests(unittest.TestCase):
+    ZONE_NO = 600
+
+    def setUp(self):
+        if client.get(f"/zones/{self.ZONE_NO}").status_code == 404:
+            r = client.post("/zones", json={
+                "zone_no": self.ZONE_NO, "polygon": SQUARE,
+                "z_min": -5, "z_max": 5})
+            self.assertEqual(r.status_code, 201, r.text)
+
+    def _review(self, **kw):
+        body = {
+            "zones": [{"zone_no": self.ZONE_NO, "version": 1}],
+            "start": [-5.0, 11.0, 0.0], "tool_radius": 0.0,
+            "gcode": "G1 X15 Y11 Z0\n"}
+        body.update(kw)
+        return client.post("/reviews", json=body)
+
+    def test_multi_tool_collision_freezes_line_tool_radius(self):
+        # 中转点 (-2,11) 距方块角 (0,10) 为 sqrt(5)≈2.236mm：r=2 静止安全，
+        # 随后 r=2 横穿 y=11（最近 1mm）途中碰撞 => 命中行 3、刀 2、半径 2
+        r = self._review(
+            gcode="G1 X-2 Y11 Z0\nT2\nG1 X15 Y11 Z0\n",
+            tool_radii={"2": 2.0}, include_min_clearance=True)
+        self.assertEqual(r.status_code, 200, r.text)
+        b = r.json()
+        self.assertTrue(b["has_collision"])
+        self.assertEqual(b["collision_line_no"], 3)
+        self.assertEqual(b["collision_zone_no"], self.ZONE_NO)
+        self.assertEqual(b["collision_tool_no"], 2)
+        self.assertEqual(b["collision_tool_radius_mm"], 2.0)
+        mc = b["min_clearance"]
+        self.assertEqual(mc["tool_no"], 2)
+        self.assertEqual(mc["tool_radius_mm"], 2.0)
+        self.assertEqual(mc["min_clearance_mm"], -1.0)
+        self.assertEqual(b["input_summary"]["tool_map_enabled"], True)
+        self.assertEqual(b["input_summary"]["tool_radii_mm"], {"2": 2.0})
+        # 固化：GET 一致
+        got = client.get(f"/reports/{b['report_id']}").json()
+        self.assertEqual(got["collision_tool_no"], 2)
+        self.assertEqual(got["collision_tool_radius_mm"], 2.0)
+        self.assertEqual(got["min_clearance"], mc)
+
+    def test_initial_tool_hit_freezes_null_tool(self):
+        r = self._review(start=[5.0, 5.0, 0.0], tool_radius=0.5,
+                         gcode="(park)\n", tool_radii={"1": 9.0})
+        b = r.json()
+        self.assertTrue(b["has_collision"])
+        self.assertIsNone(b["collision_line_no"])
+        self.assertIsNone(b["collision_tool_no"])
+        self.assertEqual(b["collision_tool_radius_mm"], 0.5)
+
+    def test_standalone_t_static_hit_line_is_t_line(self):
+        r = self._review(start=[0.0, 11.0, 0.0],
+                         gcode="G1 X0 Y11\nT3\nG1 X5 Y11\n",
+                         tool_radii={3: 2.0})
+        b = r.json()
+        self.assertTrue(b["has_collision"])
+        self.assertEqual(b["collision_line_no"], 2)
+        self.assertEqual(b["collision_tool_no"], 3)
+        self.assertEqual(b["collision_tool_radius_mm"], 2.0)
+
+    def test_small_tool_after_switch_no_collision(self):
+        # 初始大刀段只在安全区抬到远处，换 r=0.5 后斜插到 y=11 横穿高度
+        r = self._review(
+            gcode="G1 X-5 Y50 Z0\nT1\nG1 X15 Y11 Z0\n",
+            tool_radius=2.0, tool_radii={"1": 0.5})
+        b = r.json()
+        self.assertFalse(b["has_collision"], r.text)
+        self.assertIsNone(b["collision_tool_no"])
+
+    def test_invalid_tool_mapping_422(self):
+        ok = self._review(tool_radii={"1": 1.0})
+        last_id = ok.json()["report_id"]
+        bad = (
+            {"tool_radii": {"-1": 1.0}},        # 负刀号
+            {"tool_radii": {"1.5": 1.0}},       # 非整数刀号
+            {"tool_radii": {"abc": 1.0}},       # 非数字刀号
+            {"tool_radii": {"1": -0.1}},        # 负半径
+            {"tool_radii": {"1": "x"}},         # 非数值半径
+            {"tool_radii": {"1": True}},        # 布尔半径
+            {"tool_radii": "not-a-map"},        # 非映射对象
+            {"tool_radii": [["1", 1.0]]},       # 非映射对象
+        )
+        for extra in bad:
+            rr = self._review(**extra)
+            self.assertEqual(rr.status_code, 422, (extra, rr.text))
+        # 非法 T 字（未映射/非整数/多个 T）同样 422
+        for gcode in ("T9\n", "T1.5\n", "T1 T2\n"):
+            rr = self._review(gcode=gcode, tool_radii={"1": 1.0})
+            self.assertEqual(rr.status_code, 422, (gcode, rr.text))
+            self.assertEqual(rr.json()["detail"]["error"], "invalid_gcode")
+        # 全部拒绝后没有新报告
+        self.assertEqual(client.get(f"/reports/{last_id + 1}").status_code, 404)
+
+    def test_empty_map_rejects_t_but_t_free_program_ok(self):
+        r = self._review(gcode="G1 X15 Y50 Z0\n", tool_radii={})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()["input_summary"]["tool_map_enabled"])
+        r2 = self._review(gcode="T0\n", tool_radii={})
+        self.assertEqual(r2.status_code, 422)
+
+    def test_legacy_without_map_t_ignored_and_fields_null(self):
+        r = self._review(gcode="T7 M6\nG1 X15 Y11 Z0\n", tool_radius=0.5)
+        b = r.json()
+        self.assertEqual(b["input_summary"].get("tool_map_enabled"), None)
+        self.assertIsNone(b["collision_tool_no"])
+        self.assertIsNone(b["collision_tool_radius_mm"])
+        # GET 同样兼容
+        got = client.get(f"/reports/{b['report_id']}").json()
+        self.assertIsNone(got["collision_tool_no"])
+        self.assertIsNone(got["collision_tool_radius_mm"])
+
+
+class SchemaMigrationTests(unittest.TestCase):
+    """旧库（缺少 v1.1/v1.2 新列）启动时幂等补齐，旧报告读取兼容。"""
+
+    def test_legacy_db_gets_columns_and_old_report_reads(self):
+        from sqlalchemy import create_engine, inspect, text
+        from sqlalchemy.orm import sessionmaker
+        from app.database import Base
+        from app import main as mainmod
+
+        legacy = create_engine(
+            "sqlite:///" + tempfile.mktemp(suffix=".db"),
+            connect_args={"check_same_thread": False}, future=True)
+        with legacy.begin() as conn:
+            conn.execute(text(
+                "CREATE TABLE reports (id INTEGER PRIMARY KEY, "
+                "created_at DATETIME, zone_versions JSON, input_summary JSON, "
+                "has_collision BOOLEAN, collision_line_no INTEGER, "
+                "collision_zone_no INTEGER, conclusion TEXT)"))
+            conn.execute(text(
+                "INSERT INTO reports (zone_versions, input_summary, "
+                "has_collision, collision_line_no, collision_zone_no, "
+                "conclusion) VALUES (:zv, :sm, 0, NULL, NULL, 'no_collision')"),
+                {"zv": json.dumps({"1": 1}),
+                 "sm": json.dumps({"tool_radius_mm": 0.5})})
+
+        mainmod._ensure_report_columns(legacy)
+        cols = {c["name"] for c in inspect(legacy).get_columns("reports")}
+        for name in ("min_clearance_enabled", "min_clearance",
+                     "collision_tool_no", "collision_tool_radius"):
+            self.assertIn(name, cols)
+        # 再跑一次幂等
+        mainmod._ensure_report_columns(legacy)
+
+        Session = sessionmaker(bind=legacy)
+        db = Session()
+        try:
+            report = db.get(models.Report, 1)
+            self.assertIsNone(report.collision_tool_no)
+            self.assertIsNone(report.collision_tool_radius)
+            self.assertFalse(bool(report.min_clearance_enabled))
+            self.assertIsNone(report.min_clearance)
+        finally:
+            db.close()
+            legacy.dispose()
 
 
 if __name__ == "__main__":

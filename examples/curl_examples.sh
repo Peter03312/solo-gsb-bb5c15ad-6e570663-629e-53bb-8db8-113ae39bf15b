@@ -96,3 +96,39 @@ curl -s -X POST "$BASE/reviews" \
         "tool_radius": 0.5,
         "gcode": "G1 X15 Y11 Z0\n"
       }'; echo
+
+echo "== 11) 多刀半径映射（tool_radii）：T2 先于本行运动生效 =="
+# 初始刀半径 tool_radius=0，首段停在安全区 (-2,11)（距方块角 sqrt(5)mm）；
+# 独立 T2 行换刀 r=2（静止刀位仍安全）；随后 y=11 横穿，最近距离 1mm < 2 => 碰撞，
+# 报告固化首碰撞行号 3、刀号 2、半径 2
+curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5, 11, 0],
+        "tool_radius": 0.0,
+        "tool_radii": {"2": 2.0},
+        "gcode": "G1 X-2 Y11 Z0\nT2\nG1 X15 Y11 Z0\n",
+        "include_min_clearance": true
+      }'; echo
+
+echo "== 12) T 可与运动同行（新半径作用于本行运动）；换回小刀后不再碰撞 =="
+curl -s -X POST "$BASE/reviews" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5, 50, 0],
+        "tool_radius": 2.0,
+        "tool_radii": {"1": 0.5},
+        "gcode": "T1 G1 X-5 Y50\nG1 X15 Y11 Z0\n"
+      }'; echo
+
+echo "== 13) 多刀模式非法输入一律 422：非整数/负数/同行多个 T/未映射刀号/非法半径 =="
+for body in \
+  '{"zones":[{"zone_no":1,"version":1}],"start":[0,0,0],"tool_radius":0.0,"gcode":"T1.5\n","tool_radii":{"1":1}}' \
+  '{"zones":[{"zone_no":1,"version":1}],"start":[0,0,0],"tool_radius":0.0,"gcode":"T9\n","tool_radii":{"1":1}}' \
+  '{"zones":[{"zone_no":1,"version":1}],"start":[0,0,0],"tool_radius":0.0,"gcode":"T1\n","tool_radii":{"-1":1}}' \
+  '{"zones":[{"zone_no":1,"version":1}],"start":[0,0,0],"tool_radius":0.0,"gcode":"T1\n","tool_radii":{"1":-0.5}}'; do
+  curl -s -o /dev/null -w "HTTP %{http_code}\n" -X POST "$BASE/reviews" \
+    -H 'Content-Type: application/json' -d "$body"
+done

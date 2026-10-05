@@ -102,6 +102,46 @@ def main() -> None:
     assert legacy["min_clearance"] is None
     print("legacy compatible: min_clearance =", legacy["min_clearance"])
 
+    # 8. 多刀半径映射（tool_radii：非负整数刀号 -> 非负有限毫米半径）
+    #    初始刀仍用 tool_radius；T2 先于其所在行运动生效，独立 T 行按新半径
+    #    检查当前静止刀位；报告固化命中时的原行号、刀号与半径。
+    mt = c.post("/reviews", json={
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5.0, 11.0, 0.0],
+        "tool_radius": 0.0,
+        "tool_radii": {"2": 2.0},
+        "gcode": ("G1 X-2 Y11 Z0\n"   # 初始刀 r=0，停在安全区
+                  "T2\n"              # 独立 T 行：换刀 r=2（静止刀位仍安全）
+                  "G1 X15 Y11 Z0\n"),  # r=2 横穿 y=11（最近 1mm）=> 碰撞
+        "include_min_clearance": True,
+    })
+    mt.raise_for_status()
+    body = mt.json()
+    print("multi-tool collision:",
+          "line", body["collision_line_no"],
+          "tool", body["collision_tool_no"],
+          "radius", body["collision_tool_radius_mm"])
+    assert body["collision_line_no"] == 3
+    assert body["collision_tool_no"] == 2
+    assert body["collision_tool_radius_mm"] == 2.0
+    assert body["min_clearance"]["tool_no"] == 2
+    # GET /reports/{id} 与提交响应一致（刀号/半径随报告固化）
+    snap = c.get(f"/reports/{body['report_id']}").json()
+    assert snap["collision_tool_no"] == 2
+    assert snap["min_clearance"]["tool_radius_mm"] == 2.0
+
+    # 9. 不传 tool_radii 时 T 仍被忽略（旧单刀请求完全兼容）
+    legacy_t = c.post("/reviews", json={
+        "zones": [{"zone_no": 1, "version": 1}],
+        "start": [-5.0, 11.0, 0.0],
+        "tool_radius": 0.5,
+        "gcode": "T9 M6\nG1 X15 Y11 Z0\n",
+    })
+    legacy_t.raise_for_status()
+    j = legacy_t.json()
+    assert j["collision_tool_no"] is None
+    print("legacy T ignored: collision_tool_no =", j["collision_tool_no"])
+
 
 if __name__ == "__main__":
     main()

@@ -25,7 +25,7 @@ from .geometry import (
     cross, dist, point_in_polygon, point_polygon_distance,
     earliest_arc_hit, subarc_hits, arc_polygon_closest,
 )
-from .gcode import Motion
+from .gcode import Motion, ToolChange
 
 
 @dataclass(frozen=True)
@@ -38,10 +38,13 @@ class Zone:
 
 @dataclass
 class Collision:
-    line_no: int
+    line_no: int | None
     zone_no: int
     progress: float          # 该段运动上的碰撞进度（t 或角度 s），仅用于排序
     order: int = 0           # 运动段序号
+    # 多刀模式/新报告固化：命中时生效刀号与半径（初始刀位刀号为 None）
+    tool_no: int | None = None
+    tool_radius: float = 0.0
 
 
 # ---------- 区间工具 ----------
@@ -324,6 +327,12 @@ def _arc_earliest(m: Motion, zone: Zone, tool_r: float) -> float | None:
 
 # ---------- 总入口 ----------
 
+def _motion_hit(m: Motion, zone: Zone, tool_r: float) -> float | None:
+    if m.kind == "line":
+        return _line_earliest(m, zone, tool_r)
+    return _arc_earliest(m, zone, tool_r)
+
+
 def check_path(motions: list[Motion], zones: list[Zone],
                tool_radius: float) -> Collision | None:
     """按程序顺序检查全部连续运动，返回首个碰撞。
@@ -334,10 +343,7 @@ def check_path(motions: list[Motion], zones: list[Zone],
     best: Collision | None = None
     for order, m in enumerate(motions):
         for zone in zones:  # zones 已按 zone_no 排序
-            if m.kind == "line":
-                prog = _line_earliest(m, zone, tool_radius)
-            else:
-                prog = _arc_earliest(m, zone, tool_radius)
+            prog = _motion_hit(m, zone, tool_radius)
             if prog is None:
                 continue
             cand = Collision(m.line_no, zone.zone_no, prog, order)
@@ -365,6 +371,69 @@ def initial_collision(pos: tuple[float, float, float],
     return None
 
 
+def _static_collision(pos: tuple[float, float, float],
+                      zones: list[Zone], tool_r: float,
+                      line_no: int | None, seq: int,
+                      tool_no: int | None) -> Collision | None:
+    """静止刀位（初始刀位或独立 T 行切换后）的最早碰撞。
+
+    静止点无“段内进度”（按 0 计）；同一点多个禁区命中时取最小编号。
+    """
+    x, y, z = pos
+    best: Collision | None = None
+    for zone in zones:  # 已按 zone_no 排序
+        if zone.z_min - EPS <= z <= zone.z_max + EPS and \
+                point_polygon_distance((x, y), zone.polygon) <= \
+                tool_r + CONTACT_EPS:
+            cand = Collision(line_no, zone.zone_no, 0.0, seq,
+                             tool_no=tool_no, tool_radius=tool_r)
+            if best is None or cand.zone_no < best.zone_no:
+                best = cand
+    return best
+
+
+def check_program(motions: list[Motion],
+                  tool_events: list[ToolChange],
+                  zones: list[Zone],
+                  start: tuple[float, float, float],
+                  initial_radius: float) -> Collision | None:
+    """多刀模式：按真实执行顺序检查初始刀位、静止换刀事件与各段运动。
+
+    事件顺序：初始刀位（seq=0，刀号为空，半径为初始刀半径）→
+    解析出的运动/静止换刀事件（seq 从 1 起）。等值先按执行顺序，
+    再按段内进度、禁区编号裁决；每段运动使用该段生效刀具的半径。
+    """
+    best = _static_collision(start, zones, initial_radius, None, 0, None)
+
+    events: list = list(tool_events) + list(motions)
+    events.sort(key=lambda e: e.seq)
+    for ev in events:
+        if isinstance(ev, ToolChange):
+            cand = _static_collision(ev.pos, zones, ev.tool_radius,
+                                     ev.line_no, ev.seq, ev.tool_no)
+            if cand is not None and (best is None or cand.order < best.order):
+                best = cand
+            continue
+        for zone in zones:  # 已按 zone_no 排序
+            prog = _motion_hit(ev, zone, ev.tool_radius)
+            if prog is None:
+                continue
+            c = Collision(ev.line_no, zone.zone_no, prog, ev.seq,
+                          tool_no=ev.tool_no, tool_radius=ev.tool_radius)
+            if best is None or _program_earlier(c, best):
+                best = c
+    return best
+
+
+def _program_earlier(a: Collision, b: Collision) -> bool:
+    """等值裁决：执行顺序（seq）→ 段内进度 → 禁区编号。"""
+    if a.order != b.order:
+        return a.order < b.order
+    if abs(a.progress - b.progress) > EPS:
+        return a.progress < b.progress
+    return a.zone_no < b.zone_no
+
+
 # ---------- 全程最小水平净间隙 ----------
 #
 # 净间隙 = 连续 XY 路径到填充多边形的最小距离 − 刀具半径。
@@ -376,11 +445,14 @@ def initial_collision(pos: tuple[float, float, float],
 @dataclass(frozen=True)
 class ClearancePoint:
     net: float                 # 最小净间隙（mm，可为负）
-    line_no: int | None        # 原行号；无运动段时为 None
-    order: int                 # 运动段序号（无运动段为 0）
-    progress: float            # 段内进度（直线 t，圆弧 s）；无运动段为 0
+    line_no: int | None        # 原行号；无运动段/初始刀位/静止换刀时为 None
+    order: int                 # 运动段序号（无运动段为 0；多刀模式为事件 seq）
+    progress: float            # 段内进度（直线 t，圆弧 s）；静止刀位为 0
     zone_no: int
     point: tuple[float, float, float]  # 取得最小值时的刀尖坐标 (x, y, z)（mm）
+    # 多刀模式/新报告固化：取得最小值时生效刀号与半径（初始刀位刀号为 None）
+    tool_no: int | None = None
+    tool_radius: float = 0.0
 
 
 def _z_at(m: Motion, t: float) -> float:
@@ -558,10 +630,49 @@ def _arc_closest(m: Motion, zone: Zone) -> tuple[float, float] | None:
                                zone.polygon)
 
 
+def _motion_clearance_point(m: Motion, zone: Zone, tool_radius: float,
+                            order: int) -> ClearancePoint | None:
+    """单段运动对单禁区：仅在 Z 窗口部分求最小净间隙候选点。"""
+    if m.kind == "line":
+        found = _line_closest(m, zone)
+    else:
+        found = _arc_closest(m, zone)
+    if found is None:
+        return None
+    d, prog = found
+    prog = max(0.0, min(1.0, prog))
+    if m.kind == "line":
+        x = m.start[0] + (m.end[0] - m.start[0]) * prog
+        y = m.start[1] + (m.end[1] - m.start[1]) * prog
+        z = _z_at(m, prog)
+    else:
+        theta = m.theta0 + m.sweep * prog
+        x = m.center[0] + m.radius * math.cos(theta)
+        y = m.center[1] + m.radius * math.sin(theta)
+        z = m.start[2]
+    return ClearancePoint(_snap_net(d, tool_radius), m.line_no, order,
+                          prog, zone.zone_no, (x, y, z))
+
+
+def _static_clearance_point(pos: tuple[float, float, float], zone: Zone,
+                            tool_radius: float, line_no: int | None,
+                            order: int,
+                            tool_no: int | None) -> ClearancePoint | None:
+    """静止刀位（初始刀位/独立 T 行）对单禁区的净间隙候选。"""
+    px, py, pz = pos
+    if not (zone.z_min - EPS <= pz <= zone.z_max + EPS):
+        return None
+    d = point_polygon_distance((px, py), zone.polygon)
+    return ClearancePoint(_snap_net(d, tool_radius), line_no, order, 0.0,
+                          zone.zone_no,
+                          (float(px), float(py), float(pz)),
+                          tool_no=tool_no, tool_radius=tool_radius)
+
+
 def minimum_clearance(motions: list[Motion], zones: list[Zone],
                       tool_radius: float,
                       start: tuple[float, float, float]) -> ClearancePoint | None:
-    """全程最小水平净间隙。
+    """全程最小水平净间隙（单刀模式）。
 
     对每段运动、每个禁区，仅在刀尖 Z 处于该禁区闭合高度范围的部分求连续 XY
     路径到填充多边形的最小距离，再减刀具半径；直线、圆弧、整圆及中途进入
@@ -584,25 +695,49 @@ def minimum_clearance(motions: list[Motion], zones: list[Zone],
 
     for order, m in enumerate(motions):
         for zone in zones:
-            if m.kind == "line":
-                found = _line_closest(m, zone)
-            else:
-                found = _arc_closest(m, zone)
-            if found is None:
+            cp = _motion_clearance_point(m, zone, tool_radius, order)
+            if cp is not None and _clearance_better(cp, best):
+                best = cp
+    return best
+
+
+def minimum_clearance_program(motions: list[Motion],
+                              tool_events: list[ToolChange],
+                              zones: list[Zone],
+                              start: tuple[float, float, float],
+                              initial_radius: float) -> ClearancePoint | None:
+    """多刀模式全程最小水平净间隙。
+
+    初始刀位（刀号为空、初始半径）先参与，随后按执行顺序（seq）合并
+    静止换刀事件与运动段；每个事件使用其生效刀具的半径计算净间隙。
+    等值先按执行顺序，再按段内进度、禁区编号裁决。
+    全程均不在任何禁区高度内时返回 None。
+    """
+    best: ClearancePoint | None = None
+    for zone in zones:  # 已按 zone_no 排序
+        cp = _static_clearance_point(start, zone, initial_radius, None,
+                                     0, None)
+        if cp is not None and _clearance_better(cp, best):
+            best = cp
+
+    events: list = list(tool_events) + list(motions)
+    events.sort(key=lambda e: e.seq)
+    for ev in events:
+        if isinstance(ev, ToolChange):
+            for zone in zones:
+                cp = _static_clearance_point(ev.pos, zone, ev.tool_radius,
+                                             ev.line_no, ev.seq, ev.tool_no)
+                if cp is not None and _clearance_better(cp, best):
+                    best = cp
+            continue
+        for zone in zones:
+            cp = _motion_clearance_point(ev, zone, ev.tool_radius, ev.seq)
+            if cp is None:
                 continue
-            d, prog = found
-            prog = max(0.0, min(1.0, prog))
-            if m.kind == "line":
-                x = m.start[0] + (m.end[0] - m.start[0]) * prog
-                y = m.start[1] + (m.end[1] - m.start[1]) * prog
-                z = _z_at(m, prog)
-            else:
-                theta = m.theta0 + m.sweep * prog
-                x = m.center[0] + m.radius * math.cos(theta)
-                y = m.center[1] + m.radius * math.sin(theta)
-                z = m.start[2]
-            cp = ClearancePoint(_snap_net(d, tool_radius), m.line_no, order,
-                                prog, zone.zone_no, (x, y, z))
+            cp = ClearancePoint(cp.net, cp.line_no, ev.seq, cp.progress,
+                                cp.zone_no, cp.point,
+                                tool_no=ev.tool_no,
+                                tool_radius=ev.tool_radius)
             if _clearance_better(cp, best):
                 best = cp
     return best

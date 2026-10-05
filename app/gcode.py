@@ -11,6 +11,12 @@
 - 缺省轴沿用前值；I/J 始终相对弧起点，缺省视为 0；
 - 圆弧只允许 XY 平面恒定 Z；I/J 同时为 0 或半径不一致等非法圆弧一律拒绝；
 - 圆弧同起终点且 I/J 非零 => 整圆；
+- T 刀号默认解析后忽略（单刀模式，与旧版一致）；当调用方传入
+  tool_radius_map（刀号 -> 毫米半径）时启用多刀模式：
+  * Tn 必须为非负整数，同一行至多一个 T，且 n 必须在映射中，否则拒绝；
+  * Tn 在其所在行先于运动生效（半径作用于本行运动）；无运动的独立 T 行
+    生成一次静止换刀事件，位置为当前刀位点；
+  * 刀与半径模态延续到下次切换；首个 T 之前的运动沿用初始刀（刀号为空）。
 - 除上述以外的任何运动/平面/坐标系指令（G18/G19/G54/G55/...、
   固定循环 G81 等、R 圆弧等）明确拒绝。
 """
@@ -60,6 +66,24 @@ class Motion:
     radius: float | None = None
     theta0: float | None = None
     sweep: float | None = None
+    # 多刀模式（tool_radius_map 启用）时固化本段生效刀具：
+    # 首次 T 切换之前为初始刀，tool_no 为 None，tool_radius 为初始半径
+    tool_no: int | None = None
+    tool_radius: float = 0.0
+    seq: int = 0            # 程序事件执行顺序（1 起，与静止换刀事件共用同一序号轴）
+
+
+@dataclass(frozen=True)
+class ToolChange:
+    """独立 T 行的静止换刀事件：当前刀位点不运动，但刀具半径切换。
+
+    多刀模式下，事件所在行也要按新半径对当前静止刀位做检查。
+    """
+    line_no: int
+    pos: tuple[float, float, float]
+    tool_no: int
+    tool_radius: float
+    seq: int
 
 
 @dataclass
@@ -68,6 +92,8 @@ class ParseResult:
     line_count: int = 0
     nonblank_count: int = 0
     final_position: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    # 多刀模式下的静止换刀事件（独立 T 行），按程序顺序排列
+    tool_events: list[ToolChange] = field(default_factory=list)
 
 
 def _strip_comment(line: str, line_no: int) -> str:
@@ -126,13 +152,29 @@ def _tokenize(line: str, line_no: int) -> list[tuple[str, float]]:
 
 
 def parse_gcode(text: str,
-                start_xyz: tuple[float, float, float]) -> ParseResult:
+                start_xyz: tuple[float, float, float],
+                tool_radius_map: dict[int, float] | None = None,
+                initial_tool_radius: float = 0.0) -> ParseResult:
     """解析 G-code 文本，返回按程序顺序排列的连续运动序列。
 
     start_xyz：毫米制初始刀尖坐标（绝对，后续 G90/G91 从该点开始模态延续）。
+
+    tool_radius_map 为 None 时为单刀模式：T 字解析后忽略，与旧版一致。
+    传入映射（可为空映射）时启用多刀模式：T 必须是非负整数、同行至多一个、
+    刀号必须在映射中；Tn 先于本行运动生效；独立 T 行产出静止换刀事件。
+    initial_tool_radius 为初始刀位（首个 T 之前）的半径（mm）。
     """
     if not isinstance(text, str):
         raise GCodeError("gcode 必须为文本")
+
+    multi_tool = tool_radius_map is not None
+    if multi_tool:
+        for _tno, _r in tool_radius_map.items():
+            if not isinstance(_tno, int) or isinstance(_tno, bool) or _tno < 0:
+                raise GCodeError("刀号必须为非负整数")
+            if not isinstance(_r, (int, float)) or isinstance(_r, bool) \
+                    or not math.isfinite(float(_r)) or _r < 0:
+                raise GCodeError(f"刀号 {_tno} 的半径必须为非负有限毫米数")
 
     result = ParseResult(final_position=start_xyz)
 
@@ -143,6 +185,10 @@ def parse_gcode(text: str,
     motion_modal: int | None = None
 
     x, y, z = start_xyz
+    # 当前刀具（初始刀刀号为空）；多刀模式下随 T 字切换
+    cur_tool_no: int | None = None
+    cur_tool_radius = float(initial_tool_radius)
+    event_seq = 0  # 程序事件序号（运动段与静止换刀事件共用，按解析顺序递增）
     lines = text.splitlines()
     result.line_count = len(lines)
 
@@ -156,6 +202,7 @@ def parse_gcode(text: str,
         # 拆分 G 字与轴字；同一地址字重复明确拒绝
         g_codes: list[int] = []
         axes: dict[str, float] = {}
+        t_codes: list[float] = []
         for letter, value in tokens:
             if letter == 'G':
                 if value != int(value):
@@ -174,11 +221,30 @@ def parse_gcode(text: str,
                 axes[letter] = value
             elif letter == 'R':
                 raise GCodeError("不支持 R 形式圆弧（仅支持 I/J 圆心格式）", idx)
-            elif letter in ("F", "S", "N", "M", "T", "P", "L", "H", "D"):
-                # 进给/转速/行号/辅助功能/刀号/补偿号等不参与几何运动，忽略
+            elif letter == 'T':
+                t_codes.append(value)
+            elif letter in ("F", "S", "N", "M", "P", "L", "H", "D"):
+                # 进给/转速/行号/辅助功能/补偿号等不参与几何运动，忽略
                 pass
             else:
                 raise GCodeError(f"不支持的地址字 {letter}", idx)
+
+        # 多刀模式：T 必须为非负整数、同行至多一个、刀号已映射；
+        # 未启用映射时 T 与旧版一样完全忽略
+        tool_switched = False
+        if t_codes and multi_tool:
+            if len(t_codes) > 1:
+                raise GCodeError("同一行出现多个 T 刀号", idx)
+            tv = t_codes[0]
+            if tv != int(tv) or tv < 0:
+                raise GCodeError(
+                    f"刀号 T{tv:g} 非法（仅支持非负整数刀号）", idx)
+            tno = int(tv)
+            if tno not in tool_radius_map:
+                raise GCodeError(f"刀号 T{tno} 未在 tool_radii 映射中", idx)
+            cur_tool_no = tno
+            cur_tool_radius = float(tool_radius_map[tno])
+            tool_switched = True
 
         # 先处理模态 G 字（平面/单位/绝对增量），再确定本行运动
         line_motion: int | None = None
@@ -207,7 +273,12 @@ def parse_gcode(text: str,
             effective_motion = G_RAPID
 
         if effective_motion is None:
-            continue  # 纯模态/辅助行，无运动
+            # 纯模态/辅助行；多刀模式下独立 T 行仍产生静止换刀事件
+            if multi_tool and tool_switched:
+                event_seq += 1
+                result.tool_events.append(ToolChange(
+                    idx, (x, y, z), cur_tool_no, cur_tool_radius, event_seq))
+            continue  # 无几何运动
 
         scale = INCH_TO_MM if unit_is_inch else 1.0
 
@@ -221,6 +292,7 @@ def parse_gcode(text: str,
         nx, ny, nz = resolve('X', x), resolve('Y', y), resolve('Z', z)
         start = (x, y, z)
         end = (nx, ny, nz)
+        emitted = False
 
         if effective_motion in (G_RAPID, G_LINE):
             # I/J 不允许搭配直线运动
@@ -230,8 +302,12 @@ def parse_gcode(text: str,
                 raise GCodeError("运动坐标必须为有限数值", idx)
             if (abs(nx - x) > EPS or abs(ny - y) > EPS
                     or abs(nz - z) > EPS):
+                event_seq += 1
                 result.motions.append(
-                    Motion("line", idx, start, end))
+                    Motion("line", idx, start, end,
+                           tool_no=cur_tool_no, tool_radius=cur_tool_radius,
+                           seq=event_seq))
+                emitted = True
         else:
             if plane != G_PLANE_XY:
                 raise GCodeError("圆弧仅支持 G17 XY 平面", idx)
@@ -272,12 +348,23 @@ def parse_gcode(text: str,
             if abs(sweep) < EPS:
                 raise GCodeError("圆弧扫掠角为零，非法圆弧", idx)
 
+            event_seq += 1
             result.motions.append(
                 Motion("arc", idx, start, end,
                        center=center, radius=r_start,
-                       theta0=theta0, sweep=sweep))
+                       theta0=theta0, sweep=sweep,
+                       tool_no=cur_tool_no, tool_radius=cur_tool_radius,
+                       seq=event_seq))
+            emitted = True
 
         x, y, z = nx, ny, nz
+
+        # T 与运动同行但该运动为零长度（未产生运动段）：按独立 T 行处理，
+        # 以新半径检查切换后的静止刀位
+        if multi_tool and tool_switched and not emitted:
+            event_seq += 1
+            result.tool_events.append(ToolChange(
+                idx, (x, y, z), cur_tool_no, cur_tool_radius, event_seq))
 
     result.final_position = (x, y, z)
     return result

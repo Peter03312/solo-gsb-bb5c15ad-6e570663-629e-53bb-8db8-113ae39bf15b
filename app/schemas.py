@@ -5,7 +5,7 @@ import math
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_serializer
 
 
 def _finite(v: float, name: str) -> float:
@@ -87,6 +87,10 @@ class ReviewRequest(BaseModel):
     gcode: str = Field(min_length=1)
     # 可选：启用后计算全程最小水平净间隙并随报告固化
     include_min_clearance: bool = False
+    # 可选：多刀模式。非负整数刀号 -> 非负有限毫米半径。
+    # 传入（含空映射）即启用：初始刀位仍用 tool_radius，G-code 中 Tn 切换；
+    # 不传时 T 被忽略，保持单刀旧行为。
+    tool_radii: dict[int, float] | None = None
 
     @field_validator("include_min_clearance", mode="before")
     @classmethod
@@ -95,6 +99,39 @@ class ReviewRequest(BaseModel):
         if not isinstance(v, bool):
             raise ValueError("include_min_clearance 必须为布尔值 true/false")
         return v
+
+    @field_validator("tool_radii", mode="before")
+    @classmethod
+    def _validate_tool_radii(cls, v):
+        # 未传 => 单刀旧模式
+        if v is None:
+            return None
+        if not isinstance(v, dict):
+            raise ValueError("tool_radii 必须为刀号到半径（mm）的映射对象")
+        normalized: dict[int, float] = {}
+        for raw_k, raw_val in v.items():
+            # JSON 键天然为字符串：接受十进制非负整数写法（如 "0"/"2"）；
+            # 拒绝小数/负数/布尔/其他类型
+            if isinstance(raw_k, bool):
+                raise ValueError("刀号必须为非负整数")
+            k: int
+            if isinstance(raw_k, int):
+                if raw_k < 0:
+                    raise ValueError("刀号必须为非负整数")
+                k = raw_k
+            elif isinstance(raw_k, str) and raw_k.isdigit():
+                k = int(raw_k)
+            else:
+                raise ValueError(f"刀号 {raw_k!r} 非法：必须为非负整数")
+            if isinstance(raw_val, bool) or not isinstance(raw_val, (int, float)):
+                raise ValueError(f"刀号 {k} 的半径必须为非负有限毫米数值")
+            rv = float(raw_val)
+            if not math.isfinite(rv) or rv < 0.0:
+                raise ValueError(f"刀号 {k} 的半径必须为非负有限毫米数值")
+            if k in normalized:
+                raise ValueError(f"刀号 {k} 在映射中重复")
+            normalized[k] = rv
+        return normalized
 
     @field_validator("tool_radius")
     @classmethod
@@ -118,6 +155,24 @@ class MinClearanceOut(BaseModel):
     point_mm: tuple[float, float, float]
     zone_no: int
     progress: float = Field(description="取得最小值处的段内进度（直线 t / 圆弧 s）")
+    # 多刀模式固化：取得最小值时生效刀号（初始刀位为 null）与半径（mm）。
+    # 两者均为 null 表示单刀模式（旧请求），序列化时省略，保持旧报告/旧客户端兼容。
+    tool_no: int | None = None
+    tool_radius_mm: float | None = None
+
+    @model_serializer(mode="plain")
+    def _serialize(self):
+        data = {
+            "min_clearance_mm": self.min_clearance_mm,
+            "line_no": self.line_no,
+            "point_mm": list(self.point_mm),
+            "zone_no": self.zone_no,
+            "progress": self.progress,
+        }
+        if self.tool_no is not None or self.tool_radius_mm is not None:
+            data["tool_no"] = self.tool_no
+            data["tool_radius_mm"] = self.tool_radius_mm
+        return data
 
 
 class ReviewResponse(BaseModel):
@@ -132,3 +187,7 @@ class ReviewResponse(BaseModel):
     # 仅当请求 include_min_clearance=true 时非空；全程不在任何禁区高度内时为 null
     min_clearance: MinClearanceOut | None = None
     min_clearance_enabled: bool = False
+    # 多刀模式固化：命中时生效刀号（初始刀位为 null）与半径（mm）；
+    # 旧请求/旧报告这两个字段为 null
+    collision_tool_no: int | None = None
+    collision_tool_radius_mm: float | None = None
